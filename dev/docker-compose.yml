@@ -1,0 +1,343 @@
+version: '3.8'
+
+services:
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - data_lake_network
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  postgres:
+    image: postgres:13
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - data_lake_network
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  hive-metastore:
+    image: ghcr.io/bitsondatadev/hive-metastore:latest
+    restart: unless-stopped
+    networks:
+      - data_lake_network
+    ports:
+      - "9083:9083"
+    environment:
+      DB_DRIVER: postgres
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB}
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      METASTORE_HOST: hive-metastore
+      METASTORE_PORT: 9083
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./conf/hive/hive-site.xml:/opt/hive-metastore/conf/metastore-site.xml
+
+  spark-master:
+    image: bitnami/spark:latest
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    networks:
+      - data_lake_network
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "false"
+      SPARK_RPC_ENCRYPTION_ENABLED: "false"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "false"
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_MASTER_PORT: 7077
+      # Enable JMX for Prometheus
+      SPARK_MASTER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=8081:/opt/prometheus/jmx_config.yaml"
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "8081:8081" # JMX Prometheus Exporter
+    volumes:
+      - spark_logs:/opt/bitnami/spark/logs
+      - ./conf/prometheus/jmx_prometheus_javaagent.jar:/opt/prometheus/jmx_prometheus_javaagent.jar
+      - ./conf/prometheus/spark_jmx_config.yaml:/opt/prometheus/jmx_config.yaml
+
+  spark-worker:
+    image: bitnami/spark:latest
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    networks:
+      - data_lake_network
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_RPC_AUTHENTICATION_ENABLED: "false"
+      SPARK_RPC_ENCRYPTION_ENABLED: "false"
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "false"
+      # Enable JMX for Prometheus
+      SPARK_WORKER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=8081:/opt/prometheus/jmx_config.yaml"
+    ports:
+      - "8081" # JMX Prometheus Exporter for workers, port needs to be unique per container if exposed
+    depends_on:
+      - spark-master
+    volumes:
+      - spark_logs:/opt/bitnami/spark/logs
+      - ./conf/prometheus/jmx_prometheus_javaagent.jar:/opt/prometheus/jmx_prometheus_javaagent.jar
+      - ./conf/prometheus/spark_jmx_config.yaml:/opt/prometheus/jmx_config.yaml
+
+  trino:
+    image: trinodb/trino:440
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    networks:
+      - data_lake_network
+    ports:
+      - "8081:8080" # Trino UI
+      - "8085:8085" # Trino JMX Exporter (configure in Trino config)
+    volumes:
+      - ./conf/trino/etc:/etc/trino
+    depends_on:
+      - hive-metastore
+      - minio
+
+  airflow-postgres:
+    image: postgres:13
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - data_lake_network
+    environment:
+      POSTGRES_DB: ${AIRFLOW_DB}
+      POSTGRES_USER: ${AIRFLOW_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_PASSWORD}
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_USER} -d ${AIRFLOW_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-init:
+    image: apache/airflow:2.8.1
+    networks:
+      - data_lake_network
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_USER}:${AIRFLOW_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        airflow db migrate
+        airflow users create -u ${AIRFLOW_WEB_USER} -p ${AIRFLOW_WEB_PASSWORD} -f ${AIRFLOW_WEB_FIRSTNAME} -l ${AIRFLOW_WEB_LASTNAME} -r Admin -e ${AIRFLOW_WEB_EMAIL}
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+
+  airflow-webserver:
+    image: apache/airflow:2.8.1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - data_lake_network
+    ports:
+      - "8082:8080"
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_USER}:${AIRFLOW_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+      AIRFLOW__WEBSERVER__AUTHENTICATE: "True"
+    command: ["airflow", "webserver"]
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    image: apache/airflow:2.8.1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - data_lake_network
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_USER}:${AIRFLOW_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB}
+    command: ["airflow", "scheduler"]
+    volumes:
+      - airflow_dags:/opt/airflow/dags
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  ingest-service:
+    build:
+      context: ./ingest-service # Assuming a folder named 'ingest-service' with a Dockerfile
+    restart: unless-stopped
+    networks:
+      - data_lake_network
+    ports:
+      - "8083:8080"
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: raw-data
+    depends_on:
+      - minio
+
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+    networks:
+      - data_lake_network
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./conf/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    depends_on:
+      - minio
+      - spark-master
+      - spark-worker # Prometheus needs to scrape workers
+      - trino
+      - airflow-webserver
+      - airflow-scheduler
+
+  grafana:
+    image: grafana/grafana:10.3.3
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - data_lake_network
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./conf/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./conf/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+    depends_on:
+      - prometheus
+      - loki
+
+  loki:
+    image: grafana/loki:2.9.4
+    restart: unless-stopped
+    networks:
+      - data_lake_network
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki_data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    restart: unless-stopped
+    networks:
+      - data_lake_network
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./conf/loki/promtail-config.yaml:/etc/promtail/config.yaml
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+
+volumes:
+  minio_data:
+  postgres_data:
+  spark_logs:
+  airflow_db_data:
+  airflow_dags:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+
+networks:
+  data_lake_network:
+    driver: bridge
