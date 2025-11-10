@@ -163,6 +163,8 @@ services:
           memory: 1G
     networks:
       - data_lake_network
+    ports:
+      - "5433:5432"
     environment:
       POSTGRES_DB: ${AIRFLOW_DB}
       POSTGRES_USER: ${AIRFLOW_USER}
