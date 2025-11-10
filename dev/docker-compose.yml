@@ -1,7 +1,6 @@
-version: '3.8'
-
 services:
   minio:
+    container_name: minio
     image: quay.io/minio/minio:latest
     restart: unless-stopped
     deploy:
@@ -27,6 +26,7 @@ services:
       retries: 3
 
   postgres:
+    container_name: postgres
     image: postgres:13
     restart: unless-stopped
     deploy:
@@ -51,6 +51,7 @@ services:
       retries: 5
 
   hive-metastore:
+    container_name: hive-metastore
     image: ghcr.io/bitsondatadev/hive-metastore:latest
     restart: unless-stopped
     networks:
@@ -73,7 +74,8 @@ services:
       - ./conf/hive/hive-site.xml:/opt/hive-metastore/conf/metastore-site.xml
 
   spark-master:
-    image: bitnami/spark:latest
+    container_name: spark-master
+    image: bitnamilegacy/spark:3.5.1
     restart: unless-stopped
     deploy:
       resources:
@@ -90,18 +92,19 @@ services:
       SPARK_MASTER_WEBUI_PORT: 8080
       SPARK_MASTER_PORT: 7077
       # Enable JMX for Prometheus
-      SPARK_MASTER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=8081:/opt/prometheus/jmx_config.yaml"
+      SPARK_MASTER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=18081:/opt/prometheus/jmx_config.yaml"
     ports:
       - "8080:8080"
       - "7077:7077"
-      - "8081:8081" # JMX Prometheus Exporter
+      - "18081:18081" # JMX Prometheus Exporter
     volumes:
       - spark_logs:/opt/bitnami/spark/logs
       - ./conf/prometheus/jmx_prometheus_javaagent.jar:/opt/prometheus/jmx_prometheus_javaagent.jar
       - ./conf/prometheus/spark_jmx_config.yaml:/opt/prometheus/jmx_config.yaml
 
   spark-worker:
-    image: bitnami/spark:latest
+    container_name: spark-worker
+    image: bitnamilegacy/spark:3.5.1
     restart: unless-stopped
     deploy:
       resources:
@@ -119,9 +122,9 @@ services:
       SPARK_RPC_ENCRYPTION_ENABLED: "false"
       SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "false"
       # Enable JMX for Prometheus
-      SPARK_WORKER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=8081:/opt/prometheus/jmx_config.yaml"
+      SPARK_WORKER_OPTS: "-javaagent:/opt/prometheus/jmx_prometheus_javaagent.jar=18082:/opt/prometheus/jmx_config.yaml"
     ports:
-      - "8081" # JMX Prometheus Exporter for workers, port needs to be unique per container if exposed
+      - "18082:18082" # JMX Prometheus Exporter for workers, port needs to be unique per container if exposed
     depends_on:
       - spark-master
     volumes:
@@ -130,6 +133,7 @@ services:
       - ./conf/prometheus/spark_jmx_config.yaml:/opt/prometheus/jmx_config.yaml
 
   trino:
+    container_name: trino
     image: trinodb/trino:440
     restart: unless-stopped
     deploy:
@@ -149,6 +153,7 @@ services:
       - minio
 
   airflow-postgres:
+    container_name: airflow-postgres
     image: postgres:13
     restart: unless-stopped
     deploy:
@@ -171,6 +176,7 @@ services:
       retries: 5
 
   airflow-init:
+    container_name: airflow-init
     image: apache/airflow:2.8.1
     networks:
       - data_lake_network
@@ -191,6 +197,7 @@ services:
         condition: service_healthy
 
   airflow-webserver:
+    container_name: airflow-webserver
     image: apache/airflow:2.8.1
     restart: unless-stopped
     deploy:
@@ -216,6 +223,7 @@ services:
         condition: service_completed_successfully
 
   airflow-scheduler:
+    container_name: airflow-scheduler
     image: apache/airflow:2.8.1
     restart: unless-stopped
     deploy:
@@ -238,6 +246,7 @@ services:
         condition: service_completed_successfully
 
   ingest-service:
+    container_name: ingest-service
     build:
       context: ./ingest-service # Assuming a folder named 'ingest-service' with a Dockerfile
     restart: unless-stopped
@@ -254,6 +263,7 @@ services:
       - minio
 
   prometheus:
+    container_name: prometheus
     image: prom/prometheus:v2.49.1
     restart: unless-stopped
     deploy:
@@ -282,6 +292,7 @@ services:
       - airflow-scheduler
 
   grafana:
+    container_name: grafana
     image: grafana/grafana:10.3.3
     restart: unless-stopped
     deploy:
@@ -305,6 +316,7 @@ services:
       - loki
 
   loki:
+    container_name: loki
     image: grafana/loki:2.9.4
     restart: unless-stopped
     networks:
@@ -316,12 +328,13 @@ services:
     command: -config.file=/etc/loki/local-config.yaml
 
   promtail:
+    container_name: promtail
     image: grafana/promtail:2.9.4
     restart: unless-stopped
     networks:
       - data_lake_network
     volumes:
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro 
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./conf/loki/promtail-config.yaml:/etc/promtail/config.yaml
     command: -config.file=/etc/promtail/config.yaml
